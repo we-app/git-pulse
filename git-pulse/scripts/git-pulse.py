@@ -339,12 +339,14 @@ def main():
         payload = {}
     cwd = payload.get("cwd") or os.getcwd()
 
+    ts = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+
     if not is_git_repo(cwd):
-        sys.exit(0)
+        emit(f"[git-pulse {ts}] {cwd} is not a git repository — nothing to check. (hook fired OK)")
 
     remotes = get_remotes(cwd)
     if not remotes:
-        sys.exit(0)
+        emit(f"[git-pulse {ts}] git repo at {cwd} has no remotes configured — nothing to check. (hook fired OK)")
 
     name, url = next(((n, u) for n, u in remotes if n == "origin"), remotes[0])
     host, owner, repo = parse_remote(url)
@@ -354,7 +356,7 @@ def main():
 
     lines = []
     title = f"{owner}/{repo}" if owner and repo else url
-    header = f"[git-pulse] {title}"
+    header = f"[git-pulse {ts}] {title}"
     if branch:
         header += f"  branch={branch}"
     lines.append(header)
@@ -441,11 +443,25 @@ def main():
         "account_used": account_used,
     })
 
+    if len(lines) == 1:
+        lines.append("• Nothing to report — all checks ran clean.")
+    lines.append("· git-pulse hook fired OK ·")
     emit("\n".join(lines))
 
 
 if __name__ == "__main__":
     try:
         main()
-    except Exception:
+    except Exception as e:
+        # Still emit something so the user knows the hook ran but stumbled.
+        ts = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+        try:
+            print(json.dumps({
+                "hookSpecificOutput": {
+                    "hookEventName": "SessionStart",
+                    "additionalContext": f"[git-pulse {ts}] hook fired but errored: {type(e).__name__}: {e}",
+                }
+            }))
+        except Exception:
+            pass
         sys.exit(0)
