@@ -1,0 +1,20 @@
+{
+  "name": "git-pulse",
+  "owner": {
+    "name": "weapp-context-sync"
+  },
+  "metadata": {
+    "description": "Git remote pulse-check for Claude Code: who pushed what since you last opened this repo, plus PR/CI status.",
+    "version": "0.2.0"
+  },
+  "plugins": [
+    {
+      "name": "git-pulse",
+      "description": "On session start, show new upstream commits (author + message), unpushed local commits, behind/ahead vs default branch, and PR/CI status.",
+      "version": "0.2.0",
+      "source": "./",
+      "category": "git",
+      "tags": ["git", "session", "github", "automation"]
+    }
+  ]
+}

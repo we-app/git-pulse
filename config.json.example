@@ -1,0 +1,9 @@
+{
+  "checks": {
+    "remote_freshness": true,
+    "pr_ci_status": true
+  },
+  "max_commits_shown": 5,
+  "default_branch_fallback": ["main", "master", "trunk", "develop"],
+  "gh_accounts_priority": []
+}
