@@ -307,36 +307,61 @@ def save_state(remote_url, state):
 
 # ---------- output ----------
 
-def emit(text):
-    # Three surfaces, on purpose:
-    #   1. systemMessage — shown by Claude Code in its small hook-output area.
-    #      Visible to the user even before they send a first message, but low-prominence.
-    #   2. additionalContext.<report> — the data, fed to Claude.
-    #   3. additionalContext.<instruction> — steers Claude to surface the report
-    #      as the very first thing in its first chat reply, which is the only way
-    #      to get a high-prominence, fully-visible message in BOTH the CLI and
-    #      the Desktop app (they render Claude's chat output identically).
+def _emit(payload):
+    print(json.dumps(payload))
+    sys.exit(0)
+
+
+def emit_session_start(text):
+    # SessionStart hook surface. systemMessage is rendered by Claude Code in
+    # its hook-output preamble (low prominence). additionalContext is invisible
+    # to the user but instructs Claude to lead its first reply with the report.
     instruction = (
-        "GIT-PULSE SESSION-START REPORT — read carefully.\n\n"
-        "When you respond to the user's first message in this session, you MUST "
-        "begin your reply by reproducing the following report verbatim, formatted "
-        "as a fenced code block so it stands out. After the code block, add one "
-        "short sentence acknowledging anything actionable (e.g. 'Local HEAD is "
-        "behind remote — want me to fetch?') and then continue to answer the user's "
-        "actual question. Do not omit the report, even if it appears trivial: the "
-        "user is using it as a heartbeat to confirm the session-start hook fired.\n\n"
+        "GIT-PULSE SESSION-START REPORT.\n\n"
+        "If a UserPromptSubmit hook surfaces the same report on the user's "
+        "first message, defer to that. Otherwise, when answering the user's "
+        "first message in this session, begin your reply by reproducing the "
+        "report below verbatim as a fenced code block, then add one short "
+        "sentence acknowledging anything actionable, then answer the user's "
+        "actual question.\n\n"
         "--- BEGIN REPORT ---\n"
         f"{text}\n"
         "--- END REPORT ---"
     )
-    print(json.dumps({
+    _emit({
         "systemMessage": text,
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
             "additionalContext": instruction,
         },
-    }))
-    sys.exit(0)
+    })
+
+
+def emit_user_prompt_submit(text):
+    # UserPromptSubmit fires when the user sends a prompt. We only emit on the
+    # first prompt of a session (gated by a flag file). additionalContext at
+    # this surface is the most reliable way to get prominent in-chat output:
+    # Claude is about to compose a real reply to a real user message, so the
+    # report ends up inside Claude's normal chat turn — visible everywhere.
+    instruction = (
+        "GIT-PULSE FIRST-PROMPT REPORT — this is the user's first message of "
+        "the session and they have NOT seen this report yet. Surface it.\n\n"
+        "Begin your response by reproducing the following report verbatim as "
+        "a fenced code block. After the code block, add one short sentence "
+        "acknowledging anything actionable (e.g. 'Local HEAD is behind remote "
+        "— want me to fetch?'). Then answer the user's actual question. "
+        "Do not skip the report, even if it appears trivial.\n\n"
+        "--- BEGIN REPORT ---\n"
+        f"{text}\n"
+        "--- END REPORT ---"
+    )
+    _emit({
+        "systemMessage": text,
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": instruction,
+        },
+    })
 
 
 def fmt_age(dt):
@@ -350,25 +375,49 @@ def fmt_age(dt):
     return f"{s // 86400}d ago"
 
 
-# ---------- main ----------
+# ---------- per-session "have I emitted yet" flag ----------
 
-def main():
-    cfg = load_config()
+def session_flag_path(session_id):
+    base = os.environ.get("CLAUDE_PLUGIN_DATA") or os.path.expanduser("~/.claude/git-pulse-data")
+    p = Path(base) / "sessions"
+    p.mkdir(parents=True, exist_ok=True)
+    return p / f"{session_id or 'unknown'}.flag"
 
+
+def has_session_flag(session_id):
+    return session_flag_path(session_id).exists()
+
+
+def set_session_flag(session_id):
     try:
-        payload = json.loads(sys.stdin.read() or "{}")
+        session_flag_path(session_id).write_text(
+            datetime.now(timezone.utc).isoformat(timespec="seconds")
+        )
     except Exception:
-        payload = {}
-    cwd = payload.get("cwd") or os.getcwd()
+        pass
 
+
+def clear_session_flag(session_id):
+    try:
+        p = session_flag_path(session_id)
+        if p.exists():
+            p.unlink()
+    except Exception:
+        pass
+
+
+# ---------- report building ----------
+
+def build_report_text(cwd, cfg, persist_state):
+    """Build the human-readable report. If persist_state, write last-seen state."""
     ts = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
 
     if not is_git_repo(cwd):
-        emit(f"[git-pulse {ts}] {cwd} is not a git repository — nothing to check. (hook fired OK)")
+        return f"[git-pulse {ts}] {cwd} is not a git repository — nothing to check. (hook fired OK)"
 
     remotes = get_remotes(cwd)
     if not remotes:
-        emit(f"[git-pulse {ts}] git repo at {cwd} has no remotes configured — nothing to check. (hook fired OK)")
+        return f"[git-pulse {ts}] git repo at {cwd} has no remotes configured — nothing to check. (hook fired OK)"
 
     name, url = next(((n, u) for n, u in remotes if n == "origin"), remotes[0])
     host, owner, repo = parse_remote(url)
@@ -399,7 +448,6 @@ def main():
         if remote_sha is None:
             lines.append("• Could not reach remote (offline, no creds, or private). Freshness skipped.")
         else:
-            # Section: remote drift since last session
             if last_seen and last_seen != remote_sha:
                 lines.append(f"• Remote moved since last session here: {last_seen[:10]} → {remote_sha[:10]}"
                              + (f"  (last seen {last_checked})" if last_checked else ""))
@@ -418,14 +466,12 @@ def main():
             else:
                 lines.append(f"• Up to date with remote ({remote_sha[:10]}).")
 
-            # Section: unpushed local commits (cached upstream)
             up = upstream_ref(cwd)
             if up:
                 ahead, behind = count_ahead_behind(cwd, up, "HEAD")
                 if ahead:
                     lines.append(f"• {ahead} unpushed local commit(s) on {branch} (vs cached {up}).")
 
-            # Section: behind/ahead vs default branch (cached)
             default_b = detect_default_branch(cwd, name, cfg.get("default_branch_fallback", []))
             if default_b and branch and branch != default_b:
                 ahead, behind = count_ahead_behind(cwd, f"{name}/{default_b}", "HEAD")
@@ -434,7 +480,6 @@ def main():
                                  f"(based on local refs, last fetched {fmt_age(fetch_age)}).")
 
     if cfg["checks"].get("pr_ci_status", True) and host and host.endswith("github.com") and owner and repo:
-        # gh_pr_for_branch may need an authenticated account; try default first, then fall back.
         pr = gh_pr_for_branch(host, owner, repo, branch)
         if pr is None and accounts:
             for acct in accounts:
@@ -451,44 +496,85 @@ def main():
             passed, failed, pending = summarize_checks(pr.get("statusCheckRollup"))
             ci = f"CI: {passed}✓ {failed}✗ {pending}…" if (passed + failed + pending) else "CI: none"
             lines.append(f"• PR #{num} {state}{draft}  mergeable={mergeable}  {ci}  {url_pr}")
-        # Silent if no PR — don't add noise.
 
-    # Trailing nudge — fetch is the user's call.
     needs_sync = any(("Remote moved" in l) or ("differs from remote" in l) or ("unpushed local" in l) for l in lines)
     if needs_sync:
         lines.append("→ Run `git fetch` (or ask Claude to) to sync local refs. No fetch was performed.")
 
-    save_state(url, {
-        "remote_sha": remote_sha or load_state(url).get("remote_sha"),
-        "branch": branch,
-        "last_checked_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "account_used": account_used,
-    })
+    if persist_state:
+        save_state(url, {
+            "remote_sha": remote_sha or load_state(url).get("remote_sha"),
+            "branch": branch,
+            "last_checked_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "account_used": account_used,
+        })
 
     if len(lines) == 1:
         lines.append("• Nothing to report — all checks ran clean.")
     lines.append("· git-pulse hook fired OK ·")
-    emit("\n".join(lines))
+    return "\n".join(lines)
+
+
+# ---------- per-event entrypoints ----------
+
+def run_session_start(payload, cfg):
+    cwd = payload.get("cwd") or os.getcwd()
+    session_id = payload.get("session_id", "")
+    # New SessionStart of any subtype (startup/resume/clear/compact) resets the
+    # per-session "already-emitted" flag, so the next UserPromptSubmit fires
+    # the prominent in-chat report — even on /clear or post-compact.
+    clear_session_flag(session_id)
+    text = build_report_text(cwd, cfg, persist_state=False)
+    emit_session_start(text)
+
+
+def run_user_prompt_submit(payload, cfg):
+    cwd = payload.get("cwd") or os.getcwd()
+    session_id = payload.get("session_id", "")
+    if has_session_flag(session_id):
+        # Already surfaced this session — stay silent on subsequent prompts.
+        sys.exit(0)
+    set_session_flag(session_id)
+    text = build_report_text(cwd, cfg, persist_state=True)
+    emit_user_prompt_submit(text)
+
+
+# ---------- main ----------
+
+def main():
+    cfg = load_config()
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except Exception:
+        payload = {}
+
+    mode = sys.argv[1] if len(sys.argv) > 1 else "session-start"
+    if mode == "session-start":
+        run_session_start(payload, cfg)
+    elif mode == "user-prompt-submit":
+        run_user_prompt_submit(payload, cfg)
+    else:
+        sys.exit(0)
 
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        # Still emit something so the user knows the hook ran but stumbled.
         ts = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
         try:
             msg = f"[git-pulse {ts}] hook fired but errored: {type(e).__name__}: {e}"
+            mode = sys.argv[1] if len(sys.argv) > 1 else "session-start"
+            event = "UserPromptSubmit" if mode == "user-prompt-submit" else "SessionStart"
             instruction = (
-                "GIT-PULSE SESSION-START REPORT — the hook errored. "
-                "Begin your reply to the user's first message with this fenced code block "
-                "so they know the hook ran but stumbled:\n\n"
+                f"GIT-PULSE {event.upper()} REPORT — the hook errored. "
+                "Begin your reply with this fenced code block:\n\n"
                 f"```\n{msg}\n```"
             )
             print(json.dumps({
                 "systemMessage": msg,
                 "hookSpecificOutput": {
-                    "hookEventName": "SessionStart",
+                    "hookEventName": event,
                     "additionalContext": instruction,
                 },
             }))

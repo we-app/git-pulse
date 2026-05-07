@@ -1,5 +1,5 @@
 {
-  "description": "Git remote pulse-check on session start (read-only).",
+  "description": "Git remote pulse-check on session start (heartbeat) + first user prompt of each session (prominent chat surface). Read-only.",
   "hooks": {
     "SessionStart": [
       {
@@ -7,7 +7,18 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/git-pulse.py\"",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/git-pulse.py\" session-start",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/git-pulse.py\" user-prompt-submit",
             "timeout": 30
           }
         ]
