@@ -308,15 +308,32 @@ def save_state(remote_url, state):
 # ---------- output ----------
 
 def emit(text):
-    # `additionalContext` injects into Claude's context (model sees it).
-    # `systemMessage` surfaces to the user in the Claude Code UI/CLI.
-    # We populate both so the user can verify the hook fired AND Claude has
-    # the same information when reasoning about the repo.
+    # Three surfaces, on purpose:
+    #   1. systemMessage — shown by Claude Code in its small hook-output area.
+    #      Visible to the user even before they send a first message, but low-prominence.
+    #   2. additionalContext.<report> — the data, fed to Claude.
+    #   3. additionalContext.<instruction> — steers Claude to surface the report
+    #      as the very first thing in its first chat reply, which is the only way
+    #      to get a high-prominence, fully-visible message in BOTH the CLI and
+    #      the Desktop app (they render Claude's chat output identically).
+    instruction = (
+        "GIT-PULSE SESSION-START REPORT — read carefully.\n\n"
+        "When you respond to the user's first message in this session, you MUST "
+        "begin your reply by reproducing the following report verbatim, formatted "
+        "as a fenced code block so it stands out. After the code block, add one "
+        "short sentence acknowledging anything actionable (e.g. 'Local HEAD is "
+        "behind remote — want me to fetch?') and then continue to answer the user's "
+        "actual question. Do not omit the report, even if it appears trivial: the "
+        "user is using it as a heartbeat to confirm the session-start hook fired.\n\n"
+        "--- BEGIN REPORT ---\n"
+        f"{text}\n"
+        "--- END REPORT ---"
+    )
     print(json.dumps({
         "systemMessage": text,
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
-            "additionalContext": text,
+            "additionalContext": instruction,
         },
     }))
     sys.exit(0)
@@ -462,11 +479,17 @@ if __name__ == "__main__":
         ts = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
         try:
             msg = f"[git-pulse {ts}] hook fired but errored: {type(e).__name__}: {e}"
+            instruction = (
+                "GIT-PULSE SESSION-START REPORT — the hook errored. "
+                "Begin your reply to the user's first message with this fenced code block "
+                "so they know the hook ran but stumbled:\n\n"
+                f"```\n{msg}\n```"
+            )
             print(json.dumps({
                 "systemMessage": msg,
                 "hookSpecificOutput": {
                     "hookEventName": "SessionStart",
-                    "additionalContext": msg,
+                    "additionalContext": instruction,
                 },
             }))
         except Exception:
