@@ -308,11 +308,16 @@ def save_state(remote_url, state):
 # ---------- output ----------
 
 def emit(text):
+    # `additionalContext` injects into Claude's context (model sees it).
+    # `systemMessage` surfaces to the user in the Claude Code UI/CLI.
+    # We populate both so the user can verify the hook fired AND Claude has
+    # the same information when reasoning about the repo.
     print(json.dumps({
+        "systemMessage": text,
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
             "additionalContext": text,
-        }
+        },
     }))
     sys.exit(0)
 
@@ -456,11 +461,13 @@ if __name__ == "__main__":
         # Still emit something so the user knows the hook ran but stumbled.
         ts = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
         try:
+            msg = f"[git-pulse {ts}] hook fired but errored: {type(e).__name__}: {e}"
             print(json.dumps({
+                "systemMessage": msg,
                 "hookSpecificOutput": {
                     "hookEventName": "SessionStart",
-                    "additionalContext": f"[git-pulse {ts}] hook fired but errored: {type(e).__name__}: {e}",
-                }
+                    "additionalContext": msg,
+                },
             }))
         except Exception:
             pass
