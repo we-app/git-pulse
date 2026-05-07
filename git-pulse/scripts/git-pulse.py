@@ -220,25 +220,71 @@ def find_remote_head(remote_url, host, owner, repo, branch, cwd, accounts):
 
 # ---------- GitHub enrichment ----------
 
-def gh_compare(host, owner, repo, base, head, max_commits):
-    """List commits between base..head via gh API. Returns list of dicts."""
+def gh_compare_full(host, owner, repo, base, head):
+    """Full compare result via gh API. Returns dict (commits, files, ahead_by, ...) or None."""
     r = run(["gh", "api", f"repos/{owner}/{repo}/compare/{base}...{head}",
-             "--hostname", host], timeout=15)
+             "--hostname", host], timeout=20)
     if not ok(r):
-        return []
+        return None
     try:
-        data = json.loads(r.stdout)
+        return json.loads(r.stdout)
     except Exception:
-        return []
+        return None
+
+
+def humanize_iso_age(iso_ts):
+    """ISO datetime string → 'Nh ago' / 'Nd ago' / etc. '?' on failure."""
+    if not iso_ts:
+        return "?"
+    try:
+        dt = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
+        s = int((datetime.now(timezone.utc) - dt).total_seconds())
+        if s < 60: return f"{s}s ago"
+        if s < 3600: return f"{s // 60}m ago"
+        if s < 86400: return f"{s // 3600}h ago"
+        return f"{s // 86400}d ago"
+    except Exception:
+        return "?"
+
+
+def render_compare(cmp, cfg, here, remote_sha, base_label):
+    """Render rich commit-list section from a gh compare payload. Returns list[str]."""
     out = []
-    for c in (data.get("commits") or [])[-max_commits:]:
+    commits = cmp.get("commits") or []
+    files = cmp.get("files") or []
+    ahead_by = cmp.get("ahead_by", len(commits))
+    files_count = len(files)
+    added = sum((f.get("additions") or 0) for f in files)
+    removed = sum((f.get("deletions") or 0) for f in files)
+
+    if not commits:
+        out.append(f"• Drift: local {here[:10]} vs remote {remote_sha[:10]} (no commit detail available).")
+        return out
+
+    oldest = (commits[0].get("commit") or {}).get("author", {}).get("date", "")
+    newest = (commits[-1].get("commit") or {}).get("author", {}).get("date", "")
+    last_author = ((commits[-1].get("author") or {}).get("login")
+                   or (commits[-1].get("commit") or {}).get("author", {}).get("name") or "?")
+
+    summary = (f"• {ahead_by} new commit(s) on remote {base_label}"
+               f" — oldest {humanize_iso_age(oldest)}, newest {humanize_iso_age(newest)} by {last_author}.")
+    out.append(summary)
+    if files_count:
+        out.append(f"  Files touched: {files_count}  (+{added} / −{removed} lines).")
+
+    cap = cfg.get("max_commits_shown", 5)
+    shown = commits[-cap:]  # API returns oldest-first; tail = newest
+    out.append(f"  Recent commits ({len(shown)} of {len(commits)}, newest first):")
+    for c in reversed(shown):
         sha = (c.get("sha") or "")[:10]
         commit = c.get("commit") or {}
         author = ((c.get("author") or {}).get("login")
-                  or (commit.get("author") or {}).get("name")
-                  or "?")
-        msg = (commit.get("message") or "").splitlines()[0] if commit.get("message") else ""
-        out.append({"sha": sha, "author": author, "message": msg})
+                  or (commit.get("author") or {}).get("name") or "?")
+        date_str = (commit.get("author") or {}).get("date", "")
+        age = humanize_iso_age(date_str)
+        msg_full = (commit.get("message") or "")
+        msg = msg_full.splitlines()[0] if msg_full else ""
+        out.append(f"    · {age:>8}  {author:<14}  {sha}  {msg[:80]}")
     return out
 
 
@@ -312,24 +358,24 @@ def _emit(payload):
     sys.exit(0)
 
 
-def emit_session_start(text):
-    # SessionStart hook surface. systemMessage is rendered by Claude Code in
-    # its hook-output preamble (low prominence). additionalContext is invisible
-    # to the user but instructs Claude to lead its first reply with the report.
+def emit_session_start(full_text, teaser):
+    # systemMessage = compact one-line teaser shown by Claude Code in its
+    # hook-output preamble. The full report goes into additionalContext so
+    # Claude has it for context, but is gently asked to defer surfacing to
+    # the UserPromptSubmit hook (which renders prominently in chat) — this
+    # avoids the user seeing the same body 2-3 times.
     instruction = (
-        "GIT-PULSE SESSION-START REPORT.\n\n"
-        "If a UserPromptSubmit hook surfaces the same report on the user's "
-        "first message, defer to that. Otherwise, when answering the user's "
-        "first message in this session, begin your reply by reproducing the "
-        "report below verbatim as a fenced code block, then add one short "
-        "sentence acknowledging anything actionable, then answer the user's "
-        "actual question.\n\n"
+        "GIT-PULSE SESSION-START SNAPSHOT (for your context only).\n\n"
+        "A separate UserPromptSubmit hook will surface the full report on "
+        "the user's first message; do NOT pre-empt it by reproducing the "
+        "report yourself unless the user explicitly asks for repo status. "
+        "Just absorb this as background context.\n\n"
         "--- BEGIN REPORT ---\n"
-        f"{text}\n"
+        f"{full_text}\n"
         "--- END REPORT ---"
     )
     _emit({
-        "systemMessage": text,
+        "systemMessage": teaser,
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
             "additionalContext": instruction,
@@ -337,26 +383,24 @@ def emit_session_start(text):
     })
 
 
-def emit_user_prompt_submit(text):
-    # UserPromptSubmit fires when the user sends a prompt. We only emit on the
-    # first prompt of a session (gated by a flag file). additionalContext at
-    # this surface is the most reliable way to get prominent in-chat output:
-    # Claude is about to compose a real reply to a real user message, so the
-    # report ends up inside Claude's normal chat turn — visible everywhere.
+def emit_user_prompt_submit(full_text):
+    # No systemMessage here — it would render as a "UserPromptSubmit says:"
+    # preamble that duplicates what Claude is about to print in chat.
+    # additionalContext steers Claude to surface the full report as the
+    # opening of its first chat reply.
     instruction = (
-        "GIT-PULSE FIRST-PROMPT REPORT — this is the user's first message of "
-        "the session and they have NOT seen this report yet. Surface it.\n\n"
-        "Begin your response by reproducing the following report verbatim as "
-        "a fenced code block. After the code block, add one short sentence "
-        "acknowledging anything actionable (e.g. 'Local HEAD is behind remote "
-        "— want me to fetch?'). Then answer the user's actual question. "
-        "Do not skip the report, even if it appears trivial.\n\n"
+        "GIT-PULSE FIRST-PROMPT REPORT — surface this in chat NOW.\n\n"
+        "Begin your response by printing the report below verbatim as a "
+        "fenced code block. After the code block, add one short sentence "
+        "acknowledging anything actionable (e.g. 'You are 4 commits behind "
+        "origin/main — want me to fetch?'). Then answer the user's actual "
+        "question. Do not skip or summarize the report — the user has not "
+        "seen its contents yet.\n\n"
         "--- BEGIN REPORT ---\n"
-        f"{text}\n"
+        f"{full_text}\n"
         "--- END REPORT ---"
     )
     _emit({
-        "systemMessage": text,
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
             "additionalContext": instruction,
@@ -409,15 +453,20 @@ def clear_session_flag(session_id):
 # ---------- report building ----------
 
 def build_report_text(cwd, cfg, persist_state):
-    """Build the human-readable report. If persist_state, write last-seen state."""
+    """Build the human-readable report. Returns (full_text, teaser).
+    teaser is a single line summary suitable for systemMessage; full_text is
+    the rich multi-line block for in-chat surfacing.
+    """
     ts = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
 
     if not is_git_repo(cwd):
-        return f"[git-pulse {ts}] {cwd} is not a git repository — nothing to check. (hook fired OK)"
+        msg = f"[git-pulse {ts}] {cwd} is not a git repository — nothing to check. (hook fired OK)"
+        return msg, msg
 
     remotes = get_remotes(cwd)
     if not remotes:
-        return f"[git-pulse {ts}] git repo at {cwd} has no remotes configured — nothing to check. (hook fired OK)"
+        msg = f"[git-pulse {ts}] git repo at {cwd} has no remotes configured — nothing to check. (hook fired OK)"
+        return msg, msg
 
     name, url = next(((n, u) for n, u in remotes if n == "origin"), remotes[0])
     host, owner, repo = parse_remote(url)
@@ -434,6 +483,7 @@ def build_report_text(cwd, cfg, persist_state):
 
     remote_sha = None
     account_used = None
+    status = "checked"
 
     if cfg["checks"].get("remote_freshness", True):
         remote_sha, account_used = find_remote_head(url, host, owner, repo, branch, cwd, accounts)
@@ -447,24 +497,33 @@ def build_report_text(cwd, cfg, persist_state):
 
         if remote_sha is None:
             lines.append("• Could not reach remote (offline, no creds, or private). Freshness skipped.")
+            status = "remote unreachable"
+        elif here == remote_sha:
+            lines.append(f"• Up to date with remote ({remote_sha[:10]}).")
+            status = "up to date"
         else:
-            if last_seen and last_seen != remote_sha:
-                lines.append(f"• Remote moved since last session here: {last_seen[:10]} → {remote_sha[:10]}"
-                             + (f"  (last seen {last_checked})" if last_checked else ""))
-                if host and host.endswith("github.com") and owner and repo:
-                    commits = gh_compare(host, owner, repo, last_seen, remote_sha,
-                                         cfg.get("max_commits_shown", 5))
-                    if commits:
-                        lines.append(f"  New commits ({len(commits)} shown):")
-                        for c in commits:
-                            msg = c["message"][:80]
-                            lines.append(f"    - {c['sha']}  {c['author']}: {msg}")
-                    else:
-                        lines.append("  (Could not list commits — likely a private repo or auth scope.)")
-            elif here and here != remote_sha:
-                lines.append(f"• Local HEAD differs from remote: {here[:10]} vs {remote_sha[:10]}.")
+            # There's drift between local HEAD and remote tip. Always try to
+            # enumerate the missing commits via gh compare so the user sees
+            # WHO did WHAT and WHEN — not just opaque SHAs.
+            cmp = None
+            base_label = "you don't have locally"
+            if host and host.endswith("github.com") and owner and repo:
+                cmp = gh_compare_full(host, owner, repo, here, remote_sha)
+                # If we have a known last_seen distinct from local HEAD,
+                # mention the "since you last opened this here" delta too.
+                if last_seen and last_seen not in (here, remote_sha):
+                    base_label = (f"you don't have locally"
+                                  f"  (also: remote moved {last_seen[:10]} → {remote_sha[:10]} "
+                                  f"since last session here{', ' + last_checked if last_checked else ''})")
+            if cmp:
+                lines.extend(render_compare(cmp, cfg, here, remote_sha, base_label))
+                lines.append(f"  Local HEAD:  {here[:10]}  (you)")
+                lines.append(f"  Remote HEAD: {remote_sha[:10]}  ({name}/{branch or 'HEAD'})")
+                status = f"{cmp.get('ahead_by', '?')} commit(s) behind"
             else:
-                lines.append(f"• Up to date with remote ({remote_sha[:10]}).")
+                lines.append(f"• Local HEAD differs from remote: {here[:10]} vs {remote_sha[:10]}"
+                             " (commit detail unavailable — non-GitHub remote, offline, or private).")
+                status = "out of sync"
 
             up = upstream_ref(cwd)
             if up:
@@ -512,7 +571,14 @@ def build_report_text(cwd, cfg, persist_state):
     if len(lines) == 1:
         lines.append("• Nothing to report — all checks ran clean.")
     lines.append("· git-pulse hook fired OK ·")
-    return "\n".join(lines)
+
+    teaser_repo = f"{owner}/{repo}" if owner and repo else url
+    teaser = f"[git-pulse {ts}] {teaser_repo}"
+    if branch:
+        teaser += f" · {branch}"
+    teaser += f" · {status}"
+
+    return "\n".join(lines), teaser
 
 
 # ---------- per-event entrypoints ----------
@@ -520,23 +586,19 @@ def build_report_text(cwd, cfg, persist_state):
 def run_session_start(payload, cfg):
     cwd = payload.get("cwd") or os.getcwd()
     session_id = payload.get("session_id", "")
-    # New SessionStart of any subtype (startup/resume/clear/compact) resets the
-    # per-session "already-emitted" flag, so the next UserPromptSubmit fires
-    # the prominent in-chat report — even on /clear or post-compact.
     clear_session_flag(session_id)
-    text = build_report_text(cwd, cfg, persist_state=False)
-    emit_session_start(text)
+    full_text, teaser = build_report_text(cwd, cfg, persist_state=False)
+    emit_session_start(full_text, teaser)
 
 
 def run_user_prompt_submit(payload, cfg):
     cwd = payload.get("cwd") or os.getcwd()
     session_id = payload.get("session_id", "")
     if has_session_flag(session_id):
-        # Already surfaced this session — stay silent on subsequent prompts.
         sys.exit(0)
     set_session_flag(session_id)
-    text = build_report_text(cwd, cfg, persist_state=True)
-    emit_user_prompt_submit(text)
+    full_text, _teaser = build_report_text(cwd, cfg, persist_state=True)
+    emit_user_prompt_submit(full_text)
 
 
 # ---------- main ----------
