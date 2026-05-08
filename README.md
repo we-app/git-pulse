@@ -17,13 +17,27 @@ reach a private repo.
 
 ## Install
 
+**Fastest path — one line in your terminal (works for both Claude Code CLI and Desktop app):**
+
+```bash
+# macOS / Linux
+curl -fsSL https://raw.githubusercontent.com/we-app/git-pulse/main/install.sh | bash
+
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/we-app/git-pulse/main/install.ps1 | iex
+```
+
+Then **restart Claude Code**. Re-run the same command any time to upgrade. See [`dist/INSTALL.md`](./dist/INSTALL.md) for `.zip`-based and manual installs, [`dist/QUICKSTART.md`](./dist/QUICKSTART.md) for a teammate-shareable guide.
+
+**Alternative — Claude Code plugin marketplace:**
+
 ```bash
 # In any Claude Code session:
 /plugin marketplace add we-app/git-pulse
 /plugin install git-pulse@git-pulse
 ```
 
-That's it. Next time you start a session in a git repo, you'll see something like:
+Either way, next time you start a session in a git repo, you'll see something like:
 
 ```
 [git-pulse] acme/widgets  branch=main  via=gh:work-account
