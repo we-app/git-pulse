@@ -247,66 +247,72 @@ def humanize_iso_age(iso_ts):
         return "?"
 
 
+def coarse_age(iso_ts):
+    """Plain-English coarse span from a single ISO ts ('a week', '~3 months')."""
+    if not iso_ts:
+        return "an unknown amount of time"
+    try:
+        dt = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
+        s = int((datetime.now(timezone.utc) - dt).total_seconds())
+        if s < 3600: return "less than an hour"
+        if s < 86400: return f"{s // 3600} hours"
+        if s < 604800:
+            d = s // 86400
+            return "a day" if d == 1 else f"{d} days"
+        if s < 2592000:
+            w = s // 604800
+            return "a week" if w == 1 else f"{w} weeks"
+        if s < 31536000:
+            m = s // 2592000
+            return "a month" if m == 1 else f"~{m} months"
+        y = s // 31536000
+        return "a year" if y == 1 else f"~{y} years"
+    except Exception:
+        return "an unknown amount of time"
+
+
+def short_age(iso_ts):
+    """Compact label without 'ago' suffix. Uses days under 30 (so 20d not 2w),
+    months under a year, years above. Stays consistent with humanize_iso_age."""
+    if not iso_ts:
+        return "?"
+    try:
+        dt = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
+        s = int((datetime.now(timezone.utc) - dt).total_seconds())
+        if s < 3600: return f"{max(1, s // 60)}m"
+        if s < 86400: return f"{s // 3600}h"
+        if s < 86400 * 30: return f"{s // 86400}d"
+        if s < 86400 * 365: return f"{s // 2592000}mo"
+        return f"{s // 31536000}y"
+    except Exception:
+        return "?"
+
+
 CONVENTIONAL_LABELS = {
-    "feat": "new features",
-    "fix": "bug fixes",
-    "docs": "documentation",
-    "chore": "chores/config",
-    "refactor": "refactors",
-    "test": "tests",
-    "perf": "performance",
-    "style": "formatting",
-    "build": "build changes",
-    "ci": "CI changes",
-    "revert": "reverts",
-    "other": "uncategorized",
+    # singular, plural — we look up the right form by count.
+    "feat":     ("new feature",     "new features"),
+    "fix":      ("bug fix",         "bug fixes"),
+    "docs":     ("doc update",      "doc updates"),
+    "chore":    ("config/chore",    "config/chores"),
+    "refactor": ("refactor",        "refactors"),
+    "test":     ("test change",     "test changes"),
+    "perf":     ("perf change",     "perf changes"),
+    "style":    ("formatting fix",  "formatting fixes"),
+    "build":    ("build change",    "build changes"),
+    "ci":       ("CI change",       "CI changes"),
+    "revert":   ("revert",          "reverts"),
+    "other":    ("other change",    "other changes"),
 }
 
 
-def plain_english_summary(commits):
-    """3-4 line plain-English summary of a list of commits. Returns list[str]."""
+def _label(t, n):
+    sing, plur = CONVENTIONAL_LABELS.get(t, (t, t))
+    return f"{n} {sing if n == 1 else plur}"
+
+
+def render_compare(cmp, cfg, here, remote_sha):
+    """Prose-style summary of a gh compare payload. Returns list[str]."""
     from collections import Counter
-    if not commits:
-        return []
-
-    authors = Counter()
-    type_buckets = Counter()
-    for c in commits:
-        author = ((c.get("author") or {}).get("login")
-                  or (c.get("commit") or {}).get("author", {}).get("name") or "?")
-        authors[author] += 1
-        msg_full = ((c.get("commit") or {}).get("message") or "")
-        first_line = msg_full.splitlines()[0] if msg_full else ""
-        m = re.match(r"^([a-z]+)(?:\([^)]+\))?!?:\s", first_line.lower())
-        type_buckets[m.group(1) if m else "other"] += 1
-
-    top_a = authors.most_common(3)
-    if len(top_a) == 1:
-        who = f"{top_a[0][0]} (all {top_a[0][1]} change(s))"
-    else:
-        who = ", ".join(f"{n} ({c})" for n, c in top_a)
-        if len(authors) > 3:
-            who += f", +{len(authors) - 3} other(s)"
-
-    type_parts = [f"{n} {CONVENTIONAL_LABELS.get(t, t)}" for t, n in type_buckets.most_common(5)]
-    type_str = ", ".join(type_parts) if type_parts else "varied changes"
-
-    latest = commits[-1]
-    latest_msg = ((latest.get("commit") or {}).get("message") or "").splitlines()[0]
-    latest_age = humanize_iso_age((latest.get("commit") or {}).get("author", {}).get("date", ""))
-    oldest_age = humanize_iso_age(((commits[0].get("commit") or {}).get("author") or {}).get("date", ""))
-
-    return [
-        "  In plain English (no jargon):",
-        f"    Who pushed:  {who}",
-        f"    What kinds:  {type_str}",
-        f"    Time span:   activity from {oldest_age} → {latest_age}",
-        f"    Newest:      \"{latest_msg[:90]}\" ({latest_age})",
-    ]
-
-
-def render_compare(cmp, cfg, here, remote_sha, base_label):
-    """Render rich commit-list section from a gh compare payload. Returns list[str]."""
     out = []
     commits = cmp.get("commits") or []
     files = cmp.get("files") or []
@@ -316,35 +322,62 @@ def render_compare(cmp, cfg, here, remote_sha, base_label):
     removed = sum((f.get("deletions") or 0) for f in files)
 
     if not commits:
-        out.append(f"• Drift: local {here[:10]} vs remote {remote_sha[:10]} (no commit detail available).")
+        out.append("You're out of sync with the remote, but I couldn't read the commit history.")
         return out
 
-    oldest = (commits[0].get("commit") or {}).get("author", {}).get("date", "")
-    newest = (commits[-1].get("commit") or {}).get("author", {}).get("date", "")
-    last_author = ((commits[-1].get("author") or {}).get("login")
-                   or (commits[-1].get("commit") or {}).get("author", {}).get("name") or "?")
+    # Tally authors & change types
+    authors = Counter()
+    type_buckets = Counter()
+    for c in commits:
+        author = ((c.get("author") or {}).get("login")
+                  or (c.get("commit") or {}).get("author", {}).get("name") or "?")
+        authors[author] += 1
+        msg_full = ((c.get("commit") or {}).get("message") or "")
+        first = msg_full.splitlines()[0] if msg_full else ""
+        m = re.match(r"^([a-z]+)(?:\([^)]+\))?!?:\s", first.lower())
+        type_buckets[m.group(1) if m else "other"] += 1
 
-    summary = (f"• {ahead_by} new commit(s) on remote {base_label}"
-               f" — oldest {humanize_iso_age(oldest)}, newest {humanize_iso_age(newest)} by {last_author}.")
-    out.append(summary)
+    top_a = authors.most_common(3)
+    if len(top_a) == 1:
+        who = f"{top_a[0][0]} ({top_a[0][1]} commits)" if top_a[0][1] != 1 else f"{top_a[0][0]} (1 commit)"
+    elif len(authors) <= 3:
+        who = ", ".join(f"{n} ({c})" for n, c in top_a)
+    else:
+        who = ", ".join(f"{n} ({c})" for n, c in top_a) + f", and {len(authors) - 3} other(s)"
+
+    type_parts = [_label(t, n) for t, n in type_buckets.most_common(5)]
+    type_str = ", ".join(type_parts) if type_parts else "various changes"
+
+    oldest_iso = (commits[0].get("commit") or {}).get("author", {}).get("date", "")
+    newest_iso = (commits[-1].get("commit") or {}).get("author", {}).get("date", "")
+    span = coarse_age(oldest_iso)
+    latest_msg = ((commits[-1].get("commit") or {}).get("message") or "").splitlines()[0]
+    latest_age = humanize_iso_age(newest_iso)
+
+    # Lead sentence — friendly, framed as "what you're missing", not "you are behind"
+    change_word = "change" if ahead_by == 1 else "changes"
+    out.append(f"There are {ahead_by} {change_word} on the remote that you don't have locally yet — pushed over the last {span}.")
+    out.append("")
+    out.append(f"Who's been working:  {who}")
+    out.append(f"Type of changes:     {type_str}")
     if files_count:
-        out.append(f"  Files touched: {files_count}  (+{added} / −{removed} lines).")
-
-    out.extend(plain_english_summary(commits))
+        out.append(f"Total impact:        {files_count} files changed, +{added} / −{removed} lines")
+    out.append(f"Latest:              \"{latest_msg[:80]}\" — {latest_age}")
+    out.append("")
 
     cap = cfg.get("max_commits_shown", 5)
     shown = commits[-cap:]  # API returns oldest-first; tail = newest
-    out.append(f"  Recent commits ({len(shown)} of {len(commits)}, newest first):")
+    out.append("Recent activity (newest first):")
     for c in reversed(shown):
-        sha = (c.get("sha") or "")[:10]
         commit = c.get("commit") or {}
         author = ((c.get("author") or {}).get("login")
                   or (commit.get("author") or {}).get("name") or "?")
         date_str = (commit.get("author") or {}).get("date", "")
-        age = humanize_iso_age(date_str)
-        msg_full = (commit.get("message") or "")
-        msg = msg_full.splitlines()[0] if msg_full else ""
-        out.append(f"    · {age:>8}  {author:<14}  {sha}  {msg[:80]}")
+        age = short_age(date_str)
+        msg = (commit.get("message") or "").splitlines()[0] if commit.get("message") else ""
+        if len(msg) > 60:
+            msg = msg[:59] + "…"
+        out.append(f"  ·  {age:<5}  {author:<14}  {msg}")
     return out
 
 
@@ -527,12 +560,12 @@ def build_report_text(cwd, cfg, persist_state):
     ts = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
 
     if not is_git_repo(cwd):
-        msg = f"[git-pulse {ts}] {cwd} is not a git repository — nothing to check. (hook fired OK)"
+        msg = f"[git-pulse · {ts}] {cwd} — not a git repository, nothing to check."
         return msg, msg
 
     remotes = get_remotes(cwd)
     if not remotes:
-        msg = f"[git-pulse {ts}] git repo at {cwd} has no remotes configured — nothing to check. (hook fired OK)"
+        msg = f"[git-pulse · {ts}] {cwd} — git repo with no remote, nothing to check."
         return msg, msg
 
     name, url = next(((n, u) for n, u in remotes if n == "origin"), remotes[0])
@@ -543,10 +576,11 @@ def build_report_text(cwd, cfg, persist_state):
 
     lines = []
     title = f"{owner}/{repo}" if owner and repo else url
-    header = f"[git-pulse {ts}] {title}"
+    header = f"[git-pulse · {ts}] {title}"
     if branch:
-        header += f"  branch={branch}"
+        header += f"  ·  branch: {branch}"
     lines.append(header)
+    lines.append("")  # blank line under the header for breathing room
 
     remote_sha = None
     account_used = None
@@ -554,56 +588,41 @@ def build_report_text(cwd, cfg, persist_state):
 
     if cfg["checks"].get("remote_freshness", True):
         remote_sha, account_used = find_remote_head(url, host, owner, repo, branch, cwd, accounts)
-        if account_used and account_used != "default":
-            lines[0] += f"  via={account_used}"
 
         prev = load_state(url)
         last_seen = prev.get("remote_sha")
-        last_checked = prev.get("last_checked_at")
         fetch_age = last_fetch_time(cwd, name)
 
         if remote_sha is None:
-            lines.append("• Could not reach remote (offline, no creds, or private). Freshness skipped.")
+            lines.append("I couldn't reach the remote (you may be offline, or this is a private repo I can't access).")
             status = "remote unreachable"
         elif here == remote_sha:
-            lines.append(f"• Up to date with remote ({remote_sha[:10]}).")
+            lines.append("You're up to date — nothing has changed on the remote since you were last here.")
             status = "up to date"
         else:
-            # There's drift between local HEAD and remote tip. Always try to
-            # enumerate the missing commits via gh compare so the user sees
-            # WHO did WHAT and WHEN — not just opaque SHAs.
             cmp = None
-            base_label = "you don't have locally"
             if host and host.endswith("github.com") and owner and repo:
                 cmp = gh_compare_full(host, owner, repo, here, remote_sha)
-                # If we have a known last_seen distinct from local HEAD,
-                # mention the "since you last opened this here" delta too.
-                if last_seen and last_seen not in (here, remote_sha):
-                    base_label = (f"you don't have locally"
-                                  f"  (also: remote moved {last_seen[:10]} → {remote_sha[:10]} "
-                                  f"since last session here{', ' + last_checked if last_checked else ''})")
             if cmp:
-                lines.extend(render_compare(cmp, cfg, here, remote_sha, base_label))
-                lines.append(f"  Local HEAD:  {here[:10]}  (you)")
-                lines.append(f"  Remote HEAD: {remote_sha[:10]}  ({name}/{branch or 'HEAD'})")
-                status = f"{cmp.get('ahead_by', '?')} commit(s) behind"
+                lines.extend(render_compare(cmp, cfg, here, remote_sha))
+                status = f"{cmp.get('ahead_by', '?')} change(s) behind"
             else:
-                lines.append(f"• Local HEAD differs from remote: {here[:10]} vs {remote_sha[:10]}"
-                             " (commit detail unavailable — non-GitHub remote, offline, or private).")
+                lines.append(f"You're out of sync with the remote, but I couldn't read the commit history "
+                             "(non-GitHub remote, offline, or a private repo I can't access).")
                 status = "out of sync"
 
             up = upstream_ref(cwd)
             if up:
-                ahead, behind = count_ahead_behind(cwd, up, "HEAD")
+                ahead, _behind = count_ahead_behind(cwd, up, "HEAD")
                 if ahead:
-                    lines.append(f"• {ahead} unpushed local commit(s) on {branch} (vs cached {up}).")
+                    lines.append("")
+                    lines.append(f"You also have {ahead} commit(s) of your own that aren't pushed yet.")
 
             default_b = detect_default_branch(cwd, name, cfg.get("default_branch_fallback", []))
             if default_b and branch and branch != default_b:
                 ahead, behind = count_ahead_behind(cwd, f"{name}/{default_b}", "HEAD")
                 if ahead is not None and behind is not None and (ahead or behind):
-                    lines.append(f"• {branch} is {ahead} ahead / {behind} behind {name}/{default_b} "
-                                 f"(based on local refs, last fetched {fmt_age(fetch_age)}).")
+                    lines.append(f"Your branch ({branch}) is {ahead} ahead and {behind} behind {default_b}.")
 
     if cfg["checks"].get("pr_ci_status", True) and host and host.endswith("github.com") and owner and repo:
         pr = gh_pr_for_branch(host, owner, repo, branch)
@@ -614,18 +633,35 @@ def build_report_text(cwd, cfg, persist_state):
                     if pr:
                         break
         if pr:
-            state = pr.get("state", "?")
+            state = (pr.get("state") or "?").lower()
             num = pr.get("number")
             draft = " (draft)" if pr.get("isDraft") else ""
-            mergeable = pr.get("mergeable") or "?"
             url_pr = pr.get("url") or ""
             passed, failed, pending = summarize_checks(pr.get("statusCheckRollup"))
-            ci = f"CI: {passed}✓ {failed}✗ {pending}…" if (passed + failed + pending) else "CI: none"
-            lines.append(f"• PR #{num} {state}{draft}  mergeable={mergeable}  {ci}  {url_pr}")
+            if passed + failed + pending:
+                ci_words = []
+                if passed: ci_words.append(f"{passed} passing")
+                if failed: ci_words.append(f"{failed} failing")
+                if pending: ci_words.append(f"{pending} running")
+                ci = ", ".join(ci_words)
+            else:
+                ci = "no CI checks"
+            lines.append("")
+            lines.append(f"Open PR #{num} ({state}{draft}) · CI: {ci}")
+            if url_pr:
+                lines.append(f"  {url_pr}")
 
-    needs_sync = any(("Remote moved" in l) or ("differs from remote" in l) or ("unpushed local" in l) for l in lines)
+    # Action-oriented closing line for any out-of-sync state
+    needs_sync = any(("don't have locally" in l)
+                     or ("out of sync" in l)
+                     or ("aren't pushed yet" in l) for l in lines)
     if needs_sync:
-        lines.append("→ Run `git fetch` (or ask Claude to) to sync local refs. No fetch was performed.")
+        lines.append("")
+        lines.append("→ Ask Claude to run `git fetch` and/or `git pull` to bring this in sync.")
+
+    # Discreet provenance trailer for multi-account users (only if non-default)
+    if account_used and account_used != "default":
+        lines.append(f"(checked via {account_used})")
 
     if persist_state:
         save_state(url, {
@@ -635,12 +671,8 @@ def build_report_text(cwd, cfg, persist_state):
             "account_used": account_used,
         })
 
-    if len(lines) == 1:
-        lines.append("• Nothing to report — all checks ran clean.")
-    lines.append("· git-pulse hook fired OK ·")
-
     teaser_repo = f"{owner}/{repo}" if owner and repo else url
-    teaser = f"[git-pulse {ts}] {teaser_repo}"
+    teaser = f"[git-pulse · {ts}] {teaser_repo}"
     if branch:
         teaser += f" · {branch}"
     teaser += f" · {status}"

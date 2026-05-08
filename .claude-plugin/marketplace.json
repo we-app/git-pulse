@@ -5,13 +5,13 @@
   },
   "metadata": {
     "description": "Git remote pulse-check for Claude Code: who pushed what since you last opened this repo, plus PR/CI status.",
-    "version": "0.5.0"
+    "version": "0.6.0"
   },
   "plugins": [
     {
       "name": "git-pulse",
       "description": "On session start, show new upstream commits (author + message), unpushed local commits, behind/ahead vs default branch, and PR/CI status.",
-      "version": "0.5.0",
+      "version": "0.6.0",
       "source": "./git-pulse",
       "category": "git",
       "tags": ["git", "session", "github", "automation"]
