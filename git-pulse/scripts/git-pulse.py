@@ -247,6 +247,64 @@ def humanize_iso_age(iso_ts):
         return "?"
 
 
+CONVENTIONAL_LABELS = {
+    "feat": "new features",
+    "fix": "bug fixes",
+    "docs": "documentation",
+    "chore": "chores/config",
+    "refactor": "refactors",
+    "test": "tests",
+    "perf": "performance",
+    "style": "formatting",
+    "build": "build changes",
+    "ci": "CI changes",
+    "revert": "reverts",
+    "other": "uncategorized",
+}
+
+
+def plain_english_summary(commits):
+    """3-4 line plain-English summary of a list of commits. Returns list[str]."""
+    from collections import Counter
+    if not commits:
+        return []
+
+    authors = Counter()
+    type_buckets = Counter()
+    for c in commits:
+        author = ((c.get("author") or {}).get("login")
+                  or (c.get("commit") or {}).get("author", {}).get("name") or "?")
+        authors[author] += 1
+        msg_full = ((c.get("commit") or {}).get("message") or "")
+        first_line = msg_full.splitlines()[0] if msg_full else ""
+        m = re.match(r"^([a-z]+)(?:\([^)]+\))?!?:\s", first_line.lower())
+        type_buckets[m.group(1) if m else "other"] += 1
+
+    top_a = authors.most_common(3)
+    if len(top_a) == 1:
+        who = f"{top_a[0][0]} (all {top_a[0][1]} change(s))"
+    else:
+        who = ", ".join(f"{n} ({c})" for n, c in top_a)
+        if len(authors) > 3:
+            who += f", +{len(authors) - 3} other(s)"
+
+    type_parts = [f"{n} {CONVENTIONAL_LABELS.get(t, t)}" for t, n in type_buckets.most_common(5)]
+    type_str = ", ".join(type_parts) if type_parts else "varied changes"
+
+    latest = commits[-1]
+    latest_msg = ((latest.get("commit") or {}).get("message") or "").splitlines()[0]
+    latest_age = humanize_iso_age((latest.get("commit") or {}).get("author", {}).get("date", ""))
+    oldest_age = humanize_iso_age(((commits[0].get("commit") or {}).get("author") or {}).get("date", ""))
+
+    return [
+        "  In plain English (no jargon):",
+        f"    Who pushed:  {who}",
+        f"    What kinds:  {type_str}",
+        f"    Time span:   activity from {oldest_age} → {latest_age}",
+        f"    Newest:      \"{latest_msg[:90]}\" ({latest_age})",
+    ]
+
+
 def render_compare(cmp, cfg, here, remote_sha, base_label):
     """Render rich commit-list section from a gh compare payload. Returns list[str]."""
     out = []
@@ -271,6 +329,8 @@ def render_compare(cmp, cfg, here, remote_sha, base_label):
     out.append(summary)
     if files_count:
         out.append(f"  Files touched: {files_count}  (+{added} / −{removed} lines).")
+
+    out.extend(plain_english_summary(commits))
 
     cap = cfg.get("max_commits_shown", 5)
     shown = commits[-cap:]  # API returns oldest-first; tail = newest
@@ -419,31 +479,38 @@ def fmt_age(dt):
     return f"{s // 86400}d ago"
 
 
-# ---------- per-session "have I emitted yet" flag ----------
+# ---------- "have I emitted for this cwd yet" flag ----------
+#
+# We gate on cwd (sha256-keyed), not session_id. Empirically Claude Code
+# passes a fresh session_id to UserPromptSubmit on every prompt, so a
+# session_id-based gate fires every time. cwd is stable across all prompts
+# in a project, so one flag-per-cwd is the correct level.
+# SessionStart resets this flag so each new session-start re-emits once.
 
-def session_flag_path(session_id):
+def cwd_flag_path(cwd):
     base = os.environ.get("CLAUDE_PLUGIN_DATA") or os.path.expanduser("~/.claude/git-pulse-data")
     p = Path(base) / "sessions"
     p.mkdir(parents=True, exist_ok=True)
-    return p / f"{session_id or 'unknown'}.flag"
+    key = hashlib.sha256((cwd or "unknown").encode("utf-8")).hexdigest()[:16]
+    return p / f"cwd-{key}.flag"
 
 
-def has_session_flag(session_id):
-    return session_flag_path(session_id).exists()
+def has_cwd_flag(cwd):
+    return cwd_flag_path(cwd).exists()
 
 
-def set_session_flag(session_id):
+def set_cwd_flag(cwd):
     try:
-        session_flag_path(session_id).write_text(
+        cwd_flag_path(cwd).write_text(
             datetime.now(timezone.utc).isoformat(timespec="seconds")
         )
     except Exception:
         pass
 
 
-def clear_session_flag(session_id):
+def clear_cwd_flag(cwd):
     try:
-        p = session_flag_path(session_id)
+        p = cwd_flag_path(cwd)
         if p.exists():
             p.unlink()
     except Exception:
@@ -585,18 +652,17 @@ def build_report_text(cwd, cfg, persist_state):
 
 def run_session_start(payload, cfg):
     cwd = payload.get("cwd") or os.getcwd()
-    session_id = payload.get("session_id", "")
-    clear_session_flag(session_id)
+    # Reset the cwd flag so the next UserPromptSubmit emits exactly once.
+    clear_cwd_flag(cwd)
     full_text, teaser = build_report_text(cwd, cfg, persist_state=False)
     emit_session_start(full_text, teaser)
 
 
 def run_user_prompt_submit(payload, cfg):
     cwd = payload.get("cwd") or os.getcwd()
-    session_id = payload.get("session_id", "")
-    if has_session_flag(session_id):
+    if has_cwd_flag(cwd):
         sys.exit(0)
-    set_session_flag(session_id)
+    set_cwd_flag(cwd)
     full_text, _teaser = build_report_text(cwd, cfg, persist_state=True)
     emit_user_prompt_submit(full_text)
 
