@@ -310,6 +310,45 @@ def _label(t, n):
     return f"{n} {sing if n == 1 else plur}"
 
 
+KNOWLEDGE_PATH_PREFIXES = ("docs/", "doc/", "documentation/", "rfcs/", "rfc/",
+                           "adr/", "decisions/", "specs/", "spec/", "notes/")
+KNOWLEDGE_FILENAME_PATTERNS = (
+    re.compile(r"^readme(\.|$)", re.IGNORECASE),
+    re.compile(r"^architecture(\.|$)", re.IGNORECASE),
+    re.compile(r"^design(\.|$)", re.IGNORECASE),
+    re.compile(r"^contributing(\.|$)", re.IGNORECASE),
+    re.compile(r"^changelog(\.|$)", re.IGNORECASE),
+    re.compile(r"^claude(\.|$)", re.IGNORECASE),  # CLAUDE.md
+    re.compile(r"^agents?(\.|$)", re.IGNORECASE),  # AGENTS.md
+)
+
+
+def is_knowledge_file(path):
+    """True if a file path looks like a docs/knowledge/decision file."""
+    if not path:
+        return False
+    p = path.lower()
+    if p.endswith(".md") or p.endswith(".mdx") or p.endswith(".rst"):
+        return True
+    if any(p.startswith(pre) for pre in KNOWLEDGE_PATH_PREFIXES):
+        return True
+    base = p.rsplit("/", 1)[-1]
+    return any(pat.match(base) for pat in KNOWLEDGE_FILENAME_PATTERNS)
+
+
+def extract_pr_refs(commits, max_refs=10):
+    """Unique sorted PR/issue numbers from commit messages (e.g. (#421))."""
+    refs = set()
+    for c in commits:
+        msg = ((c.get("commit") or {}).get("message") or "")
+        for m in re.finditer(r"#(\d+)", msg):
+            try:
+                refs.add(int(m.group(1)))
+            except ValueError:
+                pass
+    return sorted(refs)
+
+
 def render_compare(cmp, cfg, here, remote_sha):
     """Prose-style summary of a gh compare payload. Returns list[str]."""
     from collections import Counter
@@ -365,8 +404,40 @@ def render_compare(cmp, cfg, here, remote_sha):
     out.append(f"Latest:              \"{latest_msg[:80]}\" — {latest_age}")
     out.append("")
 
+    # Knowledge / docs surfaced separately — these are usually the most
+    # context-rich commits for a returning collaborator.
+    knowledge = [f for f in files if is_knowledge_file(f.get("filename") or "")]
+    if knowledge:
+        knowledge.sort(key=lambda f: -((f.get("additions") or 0) + (f.get("deletions") or 0)))
+        out.append("")
+        out.append("Knowledge / docs added or changed (worth reading first):")
+        cap_k = cfg.get("max_knowledge_files_shown", 6)
+        for f in knowledge[:cap_k]:
+            path = f.get("filename") or "?"
+            adds = f.get("additions") or 0
+            dels = f.get("deletions") or 0
+            status = (f.get("status") or "").lower()
+            verb = "new" if status == "added" else ("renamed" if status == "renamed"
+                   else "removed" if status == "removed" else "edited")
+            if len(path) > 56:
+                path = "…" + path[-55:]
+            out.append(f"  ·  [{verb:<7}]  {path}   (+{adds} / −{dels})")
+        if len(knowledge) > cap_k:
+            out.append(f"  ·  …and {len(knowledge) - cap_k} more knowledge file(s).")
+
+    # PR/issue refs lifted from commit messages — natural entry points.
+    pr_refs = extract_pr_refs(commits)
+    if pr_refs:
+        cap_p = 12
+        ref_str = ", ".join(f"#{n}" for n in pr_refs[:cap_p])
+        if len(pr_refs) > cap_p:
+            ref_str += f"  (+{len(pr_refs) - cap_p} more)"
+        out.append("")
+        out.append(f"PRs / issues referenced: {ref_str}")
+
     cap = cfg.get("max_commits_shown", 5)
     shown = commits[-cap:]  # API returns oldest-first; tail = newest
+    out.append("")
     out.append("Recent activity (newest first):")
     for c in reversed(shown):
         commit = c.get("commit") or {}
@@ -477,18 +548,30 @@ def emit_session_start(full_text, teaser):
 
 
 def emit_user_prompt_submit(full_text):
-    # No systemMessage here — it would render as a "UserPromptSubmit says:"
-    # preamble that duplicates what Claude is about to print in chat.
-    # additionalContext steers Claude to surface the full report as the
-    # opening of its first chat reply.
+    # Goal: speed up context recovery for both technical AND non-technical
+    # users. The script surfaces the structured receipts; Claude is much
+    # better at writing a 2-3 sentence "what actually happened" narrative
+    # from those receipts than any deterministic templating.
     instruction = (
-        "GIT-PULSE FIRST-PROMPT REPORT — surface this in chat NOW.\n\n"
-        "Begin your response by printing the report below verbatim as a "
-        "fenced code block. After the code block, add one short sentence "
-        "acknowledging anything actionable (e.g. 'You are 4 commits behind "
-        "origin/main — want me to fetch?'). Then answer the user's actual "
-        "question. Do not skip or summarize the report — the user has not "
-        "seen its contents yet.\n\n"
+        "GIT-PULSE FIRST-PROMPT REPORT — surface this in chat NOW. "
+        "Compose your reply in this exact order:\n\n"
+        "1. SUMMARY (your own prose, 2–3 sentences): in plain English, "
+        "describe what actually happened on the remote since the user was "
+        "last here, drawing on the structured report below. Focus on "
+        "SUBSTANCE — what knowledge was added, what decisions were made, "
+        "what problems were fixed — not mechanics like commit counts. If "
+        "the changes are mostly housekeeping (snyk-bot bumps, formatting), "
+        "say that plainly. If 'Knowledge / docs' files appear, name what "
+        "topics they cover and why they matter. If PR refs appear and the "
+        "user might benefit from reading them, say so. If the repo is up "
+        "to date or the user is ahead, write a single line instead.\n\n"
+        "2. STRUCTURED REPORT (verbatim): print the block below inside a "
+        "fenced code block. Do not paraphrase or trim — the user wants the "
+        "receipts.\n\n"
+        "3. NEXT STEP (one short sentence): offer an actionable follow-up, "
+        "e.g. 'Want me to fetch and walk you through the new Gotoo docs?' "
+        "or 'Want me to run `git pull` to bring this in sync?'.\n\n"
+        "4. Then answer the user's actual question.\n\n"
         "--- BEGIN REPORT ---\n"
         f"{full_text}\n"
         "--- END REPORT ---"
